@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+pymupdf
+sentence-transformers
+faiss-cpu
+groq
+python-dotenv
+scikit-learn==1.9.1
+joblib
