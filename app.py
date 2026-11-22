@@ -447,7 +447,9 @@ def page_requests():
     st.title("🆘 Emergency Requests")
     st.caption("Register a request. Its priority is suggested automatically as you type.")
 
-    tab_new, tab_all = st.tabs(["➕ New request", "📋 All requests"])
+    tab_new, tab_batch, tab_all = st.tabs(
+        ["➕ New request", "🤖 UiPath / Batch Import", "📋 All requests"]
+    )
 
     with tab_new:
         if st.session_state["flash"]:
@@ -531,6 +533,98 @@ def page_requests():
                 st.session_state["form_version"] += 1
                 st.rerun()
 
+    with tab_batch:
+        st.write("### 🤖 UiPath RPA & Batch Request Ingestion")
+        st.caption(
+            "UiPath robots can monitor emergency helplines, emails, or field spreadsheets and feed CSV files here for automatic AI analysis and queueing."
+        )
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            uploaded_file = st.file_uploader(
+                "Upload distress CSV (from UiPath or field team)",
+                type=["csv"],
+                key="uipath_csv_upload",
+            )
+        with c2:
+            st.write("**Or load local file:**")
+            local_sample = Path("uipath_incoming_emergencies.csv")
+            has_sample = local_sample.exists()
+            if stretch_button(
+                "📂 Load uipath_incoming_emergencies.csv",
+                disabled=not has_sample,
+                key="btn_load_uipath_sample",
+            ):
+                st.session_state["selected_batch_file"] = "local"
+
+        file_to_process = None
+        if uploaded_file is not None:
+            file_to_process = uploaded_file
+        elif st.session_state.get("selected_batch_file") == "local" and local_sample.exists():
+            file_to_process = local_sample
+
+        if file_to_process is not None:
+            try:
+                df_in = pd.read_csv(file_to_process)
+                required_cols = {"Emergency", "Location", "Description", "Resource", "Quantity"}
+                if not required_cols.issubset(set(df_in.columns)):
+                    st.error(f"Missing required columns. Expected: {', '.join(required_cols)}")
+                else:
+                    st.write(f"**Found {len(df_in)} request(s) to import:**")
+                    st.dataframe(df_in, use_container_width=True)
+
+                    if stretch_button(
+                        f"⚡ Ingest {len(df_in)} requests with AI Priority Assessment",
+                        type="primary",
+                        key="btn_confirm_ingest",
+                    ):
+                        imported_count = 0
+                        for _, row in df_in.iterrows():
+                            em = str(row.get("Emergency", "Other")).strip()
+                            loc = str(row.get("Location", "")).strip().title()
+                            desc = str(row.get("Description", "")).strip()
+                            res = str(row.get("Resource", "Other")).strip()
+                            try:
+                                qty = int(row.get("Quantity", 1))
+                            except (ValueError, TypeError):
+                                qty = 1
+
+                            if not loc or not desc:
+                                continue
+
+                            assessment = assess_request(em, desc, res, qty)
+                            pri = assessment["priority"]
+                            ml = assessment["ml"]
+                            n_id = next_request_id()
+
+                            st.session_state["requests"].append({
+                                "ID": n_id,
+                                "Emergency": em,
+                                "Location": loc,
+                                "Description": desc,
+                                "Resource": res,
+                                "Quantity": qty,
+                                "Priority": pri,
+                                "Status": "Pending",
+                                "AI Category": (
+                                    ("⚠️ " if ml and ml["requires_review"] else "")
+                                    + f"{ml['label']} ({ml['confidence']:.0%})"
+                                    if ml else ""
+                                ),
+                            })
+                            imported_count += 1
+
+                        add_log(f"UiPath RPA: imported {imported_count} requests with AI assessment.")
+                        st.session_state["toast"] = (
+                            f"Successfully imported {imported_count} requests!",
+                            "🤖",
+                        )
+                        st.session_state.pop("selected_batch_file", None)
+                        st.session_state["form_version"] += 1
+                        st.rerun()
+            except Exception as ex:
+                st.error(f"Error reading CSV: {ex}")
+
     with tab_all:
         req_df = requests_df()
         f1, f2 = st.columns(2)
@@ -547,12 +641,67 @@ def page_requests():
         else:
             show_df(display_requests(view))
 
-        st.download_button(
-            "⬇️ Download requests as CSV",
-            req_df.to_csv(index=False).encode("utf-8"),
-            file_name="reliefmatch_requests.csv",
-            mime="text/csv",
+        down_col, del_fulfilled_col = st.columns([1, 1])
+        with down_col:
+            st.download_button(
+                "⬇️ Download requests as CSV",
+                req_df.to_csv(index=False).encode("utf-8"),
+                file_name="reliefmatch_requests.csv",
+                mime="text/csv",
+            )
+
+        allocated_count = sum(
+            1 for r in st.session_state["requests"] if r.get("Status") == "Allocated"
         )
+        with del_fulfilled_col:
+            if allocated_count > 0:
+                if stretch_button(
+                    f"🧹 Remove all fulfilled requests ({allocated_count})",
+                    key="remove_fulfilled_btn",
+                ):
+                    st.session_state["requests"] = [
+                        r
+                        for r in st.session_state["requests"]
+                        if r.get("Status") != "Allocated"
+                    ]
+                    add_log(f"Removed {allocated_count} fulfilled request(s).")
+                    st.session_state["toast"] = (
+                        f"Removed {allocated_count} fulfilled request(s).",
+                        "🧹",
+                    )
+                    st.rerun()
+
+        st.divider()
+        st.write("##### 🗑️ Delete an unwanted / mistaken request")
+        if st.session_state["requests"]:
+            req_options = {
+                r["ID"]: (
+                    f"{r['ID']} · {r['Emergency']} ({r['Location']}) · "
+                    f"{r['Quantity']} × {r['Resource']} [{r.get('Status', 'Pending')}]"
+                )
+                for r in st.session_state["requests"]
+            }
+            sel_col, btn_col = st.columns([3, 1])
+            selected_to_delete = sel_col.selectbox(
+                "Select request to remove",
+                options=list(req_options.keys()),
+                format_func=lambda req_id: req_options[req_id],
+                key="select_req_to_delete",
+                label_visibility="collapsed",
+            )
+            with btn_col:
+                if stretch_button("🗑️ Delete request", key="btn_delete_req"):
+                    st.session_state["requests"] = [
+                        r
+                        for r in st.session_state["requests"]
+                        if r["ID"] != selected_to_delete
+                    ]
+                    add_log(f"{selected_to_delete}: request deleted by user.")
+                    st.session_state["toast"] = (
+                        f"Request {selected_to_delete} deleted.",
+                        "🗑️",
+                    )
+                    st.rerun()
 
 
 def page_inventory():
